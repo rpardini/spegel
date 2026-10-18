@@ -1,20 +1,23 @@
-name: release
+name: publish
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+  workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
   packages: write
   id-token: write
 defaults:
   run:
     shell: bash
 jobs:
-  release:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          fetch-depth: 0
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -33,18 +36,23 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Run GoReleaser
+      - name: Compute version
+        id: version
+        run: |
+          TAG=$(git describe --tags --abbrev=0 --exclude '*-rc*')
+          VERSION=${TAG#v}-${GITHUB_RUN_NUMBER}.g$(git rev-parse --short HEAD)
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
+      - name: Build binaries
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 #v7.2.3
         with:
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          args: build --snapshot --clean
       - name: Generate images meta
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 #v6.2.0
         with:
-          images: ghcr.io/${{ github.repository_owner }}/spegel
-          tags: type=raw,value=${{ github.event.release.tag_name }}
+          images: ghcr.io/${{ steps.version.outputs.OWNER }}/spegel
+          tags: type=raw,value=v${{ steps.version.outputs.VERSION }}
       - name: Publish multi-arch image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc #v7.4.0
         id: build
@@ -53,23 +61,23 @@ jobs:
           builder: ${{ steps.buildx.outputs.name }}
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm/v7,linux/arm64
-          tags: ghcr.io/${{ github.repository_owner }}/spegel:${{ github.event.release.tag_name }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
       - name: Sign the image with Cosign
         run: |
-          cosign sign --yes ghcr.io/${{ github.repository_owner }}/spegel@${{ steps.build.outputs.DIGEST }}
+          cosign sign --yes ghcr.io/${{ steps.version.outputs.OWNER }}/spegel@${{ steps.build.outputs.DIGEST }}
       - name: Publish Helm chart to GHCR
         id: helm
         run: |
-          HELM_VERSION=${{ github.event.release.tag_name }}
-          HELM_VERSION=${HELM_VERSION#v}
+          VERSION=${{ steps.version.outputs.VERSION }}
           rm charts/spegel/artifacthub-repo.yml
+          yq -i '.image.repository = "ghcr.io/${{ steps.version.outputs.OWNER }}/spegel"' charts/spegel/values.yaml
           yq -i '.image.digest = "${{ steps.build.outputs.DIGEST }}"' charts/spegel/values.yaml
-          helm package --app-version ${{ github.event.release.tag_name }} --version ${HELM_VERSION} charts/spegel
-          helm push spegel-${HELM_VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/helm-charts 2> .digest
+          helm package --app-version v${VERSION} --version ${VERSION} charts/spegel
+          helm push spegel-${VERSION}.tgz oci://ghcr.io/${{ steps.version.outputs.OWNER }}/helm-charts 2> .digest
           DIGEST=$(cat .digest | awk -F "[, ]+" '/Digest/{print $NF}')
           echo "DIGEST=${DIGEST}" >> $GITHUB_OUTPUT
       - name: Sign the Helm chart with Cosign
         run: |
-          cosign sign --yes ghcr.io/${{ github.repository_owner }}/helm-charts/spegel@${{ steps.helm.outputs.DIGEST }}
+          cosign sign --yes ghcr.io/${{ steps.version.outputs.OWNER }}/helm-charts/spegel@${{ steps.helm.outputs.DIGEST }}
